@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+"""
+Normal2Mesh.py
+Normal map → PLY mesh via Frankot-Chellappa Fourier integration.
+Compile with:  pyinstaller --onefile --windowed --icon=normal_icon.ico --add-data "normal_icon.png;." Normal2Mesh.py
+"""
+
+# ─────────────────────── version / feature flags ─────────────────────────────
+APP_VERSION = "2.0"
+
+# Set to True to show the [Debug] re-derive checkbox in the Flattening panel.
+SHOW_DEBUG_OPTIONS = False
+
+import os
+import sys
+import math
+import threading
+import traceback
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageTk
+
+# ─────────────────────────── stdout/stderr safety ────────────────────────────
+if sys.stdout is None:
+    sys.stdout = open("Normal2Mesh_early.log", "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = sys.stdout
+
+# ──────────────────────────── helper functions ───────────────────────────────
+
+def resource_path(relative):
+    """Resolve path whether running as script or frozen .exe."""
+    try:
+        base = sys._MEIPASS
+    except Exception:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative)
+
+def check_stop(stop_event):
+    if stop_event and stop_event.is_set():
+        raise InterruptedError("Process cancelled by user.")
+
+# ──────────────────────────── core processing ────────────────────────────────
+
+def load_normal_map(path):
+    img = Image.open(path).convert("RGB")
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    normals = arr * 2.0 - 1.0
+    nlen = np.linalg.norm(normals, axis=2, keepdims=True)
+    return normals / np.clip(nlen, 1e-8, None)
+
+
+def resize_normals(normals, divisor):
+    if divisor == 1:
+        return normals
+    h, w, _ = normals.shape
+    target = max(1, int(round((w * h) / divisor)))
+    aspect = w / max(h, 1)
+    best_w, best_h = w, h
+    best_score = None
+    max_search = max(4, int(math.sqrt(target)) + 4)
+    for nh in range(1, max_search + 1):
+        nw = max(1, int(round(target / nh)))
+        ratio = nw / nh
+        score = abs(nw * nh - target) + 0.25 * target * abs(math.log(max(ratio, 1e-8) / aspect))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_w, best_h = nw, nh
+    img = Image.fromarray(
+        np.clip((normals * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8), mode="RGB"
+    )
+    img = img.resize((best_w, best_h), Image.Resampling.BOX)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    n = arr * 2.0 - 1.0
+    nlen = np.linalg.norm(n, axis=2, keepdims=True)
+    return n / np.clip(nlen, 1e-8, None)
+
+
+def normals_to_gradients(normals, flip_y=False, eps=1e-6):
+    nx, ny, nz = normals[..., 0], normals[..., 1], normals[..., 2]
+    nz = np.where(np.abs(nz) < eps, np.sign(nz) * eps + (nz == 0) * eps, nz)
+    p = -nx / nz
+    q = -ny / nz
+    if flip_y:
+        q = -q
+    return p, q
+
+
+def frankot_chellappa(p, q):
+    h, w = p.shape
+    wx = 2.0 * np.pi * np.fft.fftfreq(w)
+    wy = 2.0 * np.pi * np.fft.fftfreq(h)
+    WX, WY = np.meshgrid(wx, wy)
+    P, Q = np.fft.fft2(p), np.fft.fft2(q)
+    denom = WX * WX + WY * WY
+    Z = np.zeros((h, w), dtype=np.complex128)
+    mask = denom > 1e-12
+    Z[mask] = (-1j * WX[mask] * P[mask] - 1j * WY[mask] * Q[mask]) / denom[mask]
+    Z[0, 0] = 0.0
+    z = np.real(np.fft.ifft2(Z))
+    return z - z.mean()
+
+
+def build_and_save_mesh_fast(z, output_path, xy_scale=1.0, z_scale=1.0, stop_event=None):
+    check_stop(stop_event)
+    h, w = z.shape
+    padded = np.pad(z, ((1, 1), (1, 1)), mode="edge")
+    zc = (padded[:-1, :-1] + padded[1:, :-1] + padded[:-1, 1:] + padded[1:, 1:]) * (0.25 * z_scale)
+
+    xs = (np.arange(w + 1, dtype=np.float32) - w / 2.0) * xy_scale
+    ys = (h / 2.0 - np.arange(h + 1, dtype=np.float32)) * xy_scale
+    X, Y = np.meshgrid(xs, ys)
+
+    us = np.linspace(0.0, 1.0, w + 1, dtype=np.float32)
+    vs = np.linspace(1.0, 0.0, h + 1, dtype=np.float32)
+    U, V = np.meshgrid(us, vs)
+
+    vertex_dtype = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'), ('s', '<f4'), ('t', '<f4')])
+    vertices = np.empty((h + 1, w + 1), dtype=vertex_dtype)
+    vertices['x'] = X; vertices['y'] = Y; vertices['z'] = zc
+    vertices['s'] = U; vertices['t'] = V
+
+    idx = np.arange((h + 1) * (w + 1), dtype=np.int32).reshape(h + 1, w + 1)
+    face_dtype = np.dtype([('count', 'u1'), ('v0', '<i4'), ('v1', '<i4'), ('v2', '<i4'), ('v3', '<i4')])
+    faces = np.empty(h * w, dtype=face_dtype)
+    faces['count'] = 4
+    faces['v0'] = idx[:-1, :-1].ravel() 
+    faces['v1'] = idx[:-1, 1:].ravel()   
+    faces['v2'] = idx[1:, 1:].ravel()    
+    faces['v3'] = idx[1:, :-1].ravel()   
+
+    num_verts = (h + 1) * (w + 1)
+    num_faces = h * w
+
+    check_stop(stop_event)
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        header = f"ply\nformat binary_little_endian 1.0\ncomment Generated by Normal2Mesh\n"
+        header += f"element vertex {num_verts}\nproperty float x\nproperty float y\nproperty float z\n"
+        header += f"property float s\nproperty float t\n"
+        header += f"element face {num_faces}\nproperty list uchar int vertex_indices\nend_header\n"
+        f.write(header.encode('ascii'))
+        vertices.ravel().tofile(f)
+        faces.tofile(f)
+
+    return num_verts, num_faces
+
+
+def fit_sphere(pts_3d):
+    """Least squares sphere fit to 3D points."""
+    A = np.zeros((len(pts_3d), 4))
+    A[:, 0] = pts_3d[:, 0] * 2
+    A[:, 1] = pts_3d[:, 1] * 2
+    A[:, 2] = pts_3d[:, 2] * 2
+    A[:, 3] = 1
+    b = np.sum(pts_3d ** 2, axis=1)
+    p, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, cz, k = p
+    R = math.sqrt(max(0, k + cx**2 + cy**2 + cz**2))
+    return cx, cy, cz, R
+
+
+def fit_quadratic_surface(pts_3d):
+    """Least-squares fit of z = a*x² + b*y² + c*x*y + d*x + e*y + f to 3D points."""
+    x, y, z = pts_3d[:, 0], pts_3d[:, 1], pts_3d[:, 2]
+    A = np.column_stack([x**2, y**2, x * y, x, y, np.ones_like(x)])
+    coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
+    return coeffs  # (a, b, c, d, e, f)
+
+
+def fit_tps(pts_3d):
+    """Thin-plate spline interpolator through 3D points (exact pass-through)."""
+    from scipy.interpolate import RBFInterpolator
+    return RBFInterpolator(pts_3d[:, :2], pts_3d[:, 2],
+                           kernel='thin_plate_spline', degree=1)
+
+
+def save_displacement(z_array, eff_z_scale, target_w, target_h, out_path_base, stop_event=None):
+    """Exports a 16-bit TIFF displacement map and a corresponding txt scale file."""
+    check_stop(stop_event)
+    z_real = z_array * eff_z_scale
+    
+    if z_array.shape[0] != target_h or z_array.shape[1] != target_w:
+        img_f = Image.fromarray(z_real.astype(np.float32), mode='F')
+        img_f = img_f.resize((target_w, target_h), Image.Resampling.BICUBIC)
+        z_real = np.array(img_f)
+
+    check_stop(stop_event)
+    min_z = float(np.min(z_real))
+    max_z = float(np.max(z_real))
+    range_z = max_z - min_z
+    
+    if range_z > 1e-8:
+        z_norm = (z_real - min_z) / range_z
+    else:
+        z_norm = np.zeros_like(z_real)
+        
+    z_16bit = (z_norm * 65535.0).astype(np.uint16)
+    
+    check_stop(stop_event)
+    tiff_path = f"{out_path_base}_disp.tiff"
+    Image.fromarray(z_16bit).save(tiff_path, format="TIFF")
+    
+    txt_path = f"{out_path_base}_disp.txt"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("Displacement Range (16-bit TIFF)\n")
+        f.write("--------------------------------\n")
+        f.write(f"Min Z: {min_z:.6g}\n")
+        f.write(f"Max Z: {max_z:.6g}\n")
+        f.write(f"Total Range: {range_z:.6g}\n\n")
+        f.write("Mapping:\n")
+        f.write("Pixel Value 0     = Min Z\n")
+        f.write("Pixel Value 65535 = Max Z\n")
+
+
+def run_conversion(input_path, output_path, downsample, xy_scale, z_scale, flip_y,
+                   flatten_pts, fitting_mode, export_orig_mesh, export_flat_norm, norm_fmt, export_disp,
+                   rederive_from_flat_norm,
+                   stop_event, progress_cb, done_cb, error_cb):
+    try:
+        print(f"--- Starting new conversion ---")
+        
+        out_base = str(Path(output_path).with_suffix(''))
+        if out_base.endswith("_flat_srf"): out_base = out_base[:-9]
+        elif out_base.endswith("_srf"): out_base = out_base[:-4]
+        
+        orig_ply_path = f"{out_base}_srf.ply"
+        flat_ply_path = f"{out_base}_flat_srf.ply"
+        rederived_ply_path = f"{out_base}_flat_srf_rederived.ply"
+        orig_disp_base = f"{out_base}_srf"
+        flat_disp_base = f"{out_base}_flat_srf"
+        rederived_disp_base = f"{out_base}_flat_srf_rederived"
+        
+        check_stop(stop_event)
+        progress_cb("Loading normal map...", 5)
+        normals = load_normal_map(input_path)
+        orig_h, orig_w = normals.shape[:2]
+        
+        check_stop(stop_event)
+        progress_cb("Resampling...", 15)
+        normals = resize_normals(normals, downsample)
+        new_h, new_w = normals.shape[:2]
+
+        ratio_w = float(orig_w) / max(1, new_w)
+        eff_xy_scale = xy_scale * ratio_w
+        eff_z_scale = z_scale * ratio_w
+        
+        check_stop(stop_event)
+        progress_cb("Computing gradients...", 25)
+        p, q = normals_to_gradients(normals, flip_y=flip_y)
+        
+        check_stop(stop_event)
+        progress_cb("Fourier integration...", 45)
+        z = frankot_chellappa(p, q)
+        
+        if export_disp and (len(flatten_pts) < 4 or export_orig_mesh):
+            check_stop(stop_event)
+            progress_cb("Generating original displacement map...", 50)
+            save_displacement(z, eff_z_scale, orig_w, orig_h, orig_disp_base, stop_event)
+            print(f"Saved displacement map: {Path(orig_disp_base + '_disp.tiff').name}")
+
+        check_stop(stop_event)
+
+        if len(flatten_pts) >= 4:
+            progress_cb("Fitting reference surface...", 60)
+
+            z_real = z * eff_z_scale
+            xs_c = (np.arange(new_w, dtype=np.float32) + 0.5 - new_w / 2.0) * eff_xy_scale
+            ys_c = (new_h / 2.0 - (np.arange(new_h, dtype=np.float32) + 0.5)) * eff_xy_scale
+            Xc, Yc = np.meshgrid(xs_c, ys_c)
+
+            pts_3d = []
+            for (px, py) in flatten_pts:
+                ix = int(round(px * new_w / orig_w))
+                iy = int(round(py * new_h / orig_h))
+                ix = max(0, min(new_w - 1, ix))
+                iy = max(0, min(new_h - 1, iy))
+                pts_3d.append([Xc[iy, ix], Yc[iy, ix], z_real[iy, ix]])
+
+            pts_3d = np.array(pts_3d)
+
+            tps = None
+            if fitting_mode == 'tps':
+                print(f"Fitting TPS surface using {len(flatten_pts)} points (may be slow at full resolution)...")
+                tps = fit_tps(pts_3d)
+                grid_pts_c = np.column_stack([Xc.ravel().astype(np.float64), Yc.ravel().astype(np.float64)])
+                Z_ref_c = tps(grid_pts_c).reshape(Xc.shape)
+                print("TPS fitted.")
+            elif fitting_mode == 'paraboloid':
+                surf_coeffs = fit_quadratic_surface(pts_3d)
+                a, b, c, d, e, f = surf_coeffs
+                Z_ref_c = a*Xc**2 + b*Yc**2 + c*Xc*Yc + d*Xc + e*Yc + f
+                print(f"Paraboloid surface fitted using {len(flatten_pts)} points.")
+            else:  # 'sphere' (default)
+                cx_s, cy_s, cz_s, R = fit_sphere(pts_3d)
+                mean_z = np.mean(pts_3d[:, 2])
+                sign = 1 if cz_s < mean_z else -1
+                val_c = np.maximum(0, R**2 - (Xc - cx_s)**2 - (Yc - cy_s)**2)
+                Z_ref_c = cz_s + sign * np.sqrt(val_c)
+                print(f"Sphere fitted: R={R:.4g}mm, Center=({cx_s:.4g}, {cy_s:.4g}, {cz_s:.4g})")
+
+            z_flat_real = z_real - Z_ref_c
+            z_flat_real -= np.mean(z_flat_real)
+            z_flat = z_flat_real / eff_z_scale
+
+            check_stop(stop_event)
+
+            if export_orig_mesh:
+                progress_cb("Saving original mesh...", 65)
+                build_and_save_mesh_fast(z, orig_ply_path, eff_xy_scale, eff_z_scale, stop_event)
+                print(f"Saved original mesh: {Path(orig_ply_path).name}")
+
+            if export_flat_norm or rederive_from_flat_norm:
+                check_stop(stop_event)
+                progress_cb("Generating flattened normal map...", 70)
+
+                normals_full = load_normal_map(input_path)
+                fh, fw = normals_full.shape[:2]
+
+                # World-space pixel centres at full resolution
+                xs_f = (np.arange(fw, dtype=np.float64) + 0.5 - fw / 2.0) * xy_scale
+                ys_f = (fh / 2.0 - (np.arange(fh, dtype=np.float64) + 0.5)) * xy_scale
+                Xf, Yf = np.meshgrid(xs_f, ys_f)
+
+                # Reference surface at full resolution
+                if fitting_mode == 'tps':
+                    print(f"[Normal map] Evaluating TPS at full resolution ({fh}×{fw})...")
+                    grid_pts_f = np.column_stack([Xf.ravel(), Yf.ravel()])
+                    Z_ref_f = tps(grid_pts_f).reshape(Xf.shape)
+                elif fitting_mode == 'paraboloid':
+                    Z_ref_f = a*Xf**2 + b*Yf**2 + c*Xf*Yf + d*Xf + e*Yf + f
+                else:  # sphere
+                    val_f = np.maximum(0.0, R**2 - (Xf - cx_s)**2 - (Yf - cy_s)**2)
+                    Z_ref_f = cz_s + sign * np.sqrt(val_f)
+
+                # Sphere/surface gradients via numerical differentiation of the CLAMPED Z_ref_f.
+                # p (X/col direction): X_world and col increase together  → no sign flip.
+                # q (Y/row direction): Y_world goes UP, row index goes DOWN → opposite directions
+                #   → dZ_ref/drow = -dZ_ref/dY_world, so q_ref uses positive np.gradient axis=0.
+                p_sphere = np.gradient(Z_ref_f, xy_scale, axis=1)
+                q_sphere = np.gradient(Z_ref_f, xy_scale, axis=0)
+
+                # Decode full-resolution input normals to gradients (world Y-up)
+                nx_in = normals_full[..., 0].astype(np.float64)
+                ny_in = normals_full[..., 1].astype(np.float64)
+                nz_in = normals_full[..., 2].astype(np.float64)
+                safe_nz = np.where(np.abs(nz_in) < 1e-6, 1e-6, nz_in)
+
+                p_orig = -nx_in / safe_nz
+                q_orig = -ny_in / safe_nz
+                if flip_y:
+                    q_orig = -q_orig  # normalise to world Y-up
+
+                # Subtract reference surface gradient to get flat-surface gradients
+                p_flat = p_orig - p_sphere
+                q_flat = q_orig - q_sphere
+
+                # Reconstruct flat normals: n = normalize(-p, -q, 1) in world space,
+                # then re-encode using the original G-channel convention.
+                fn_x = -p_flat
+                fn_y = -q_flat if not flip_y else q_flat  # re-apply map convention
+                fn_z = np.ones_like(fn_x)
+
+                length = np.sqrt(fn_x**2 + fn_y**2 + fn_z**2)
+                fn_x /= length; fn_y /= length; fn_z /= length
+
+                r = np.clip((fn_x * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
+                g = np.clip((fn_y * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
+                b_ch = np.clip((fn_z * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
+
+                flat_norm_img = Image.fromarray(np.stack([r, g, b_ch], axis=-1))
+
+                if export_flat_norm:
+                    ext = norm_fmt.lower()
+                    norm_out = f"{out_base}_flat_normal.{ext}"
+                    if ext == "jpg":
+                        flat_norm_img.save(norm_out, "JPEG", quality=100)
+                    elif ext == "tiff":
+                        flat_norm_img.save(norm_out, "TIFF")
+                    else:
+                        flat_norm_img.save(norm_out, "PNG")
+                    print(f"Saved flattened normal map: {Path(norm_out).name}")
+
+                if rederive_from_flat_norm:
+                    check_stop(stop_event)
+                    progress_cb("Re-deriving mesh from flattened normal map (debug)...", 76)
+                    print(f"[Debug] Re-deriving via Frankot-Chellappa on flattened normals ({fh}×{fw})...")
+                    flat_normals_arr = np.stack([fn_x, fn_y, fn_z], axis=-1).astype(np.float32)
+                    nlen_rd = np.linalg.norm(flat_normals_arr, axis=2, keepdims=True)
+                    flat_normals_arr /= np.clip(nlen_rd, 1e-8, None)
+                    p_rd, q_rd = normals_to_gradients(flat_normals_arr, flip_y=flip_y)
+                    z_rd = frankot_chellappa(p_rd, q_rd)
+                    build_and_save_mesh_fast(z_rd, rederived_ply_path, xy_scale, z_scale, stop_event)
+                    print(f"[Debug] Saved rederived mesh: {Path(rederived_ply_path).name}")
+                    if export_disp:
+                        check_stop(stop_event)
+                        save_displacement(z_rd, z_scale, orig_w, orig_h, rederived_disp_base, stop_event)
+                        print(f"[Debug] Saved rederived displacement: {Path(rederived_disp_base + '_disp.tiff').name}")
+
+            if export_disp:
+                check_stop(stop_event)
+                progress_cb("Generating flattened displacement map...", 75)
+                save_displacement(z_flat, eff_z_scale, orig_w, orig_h, flat_disp_base, stop_event)
+                print(f"Saved flattened displacement: {Path(flat_disp_base + '_disp.tiff').name}")
+            
+            z = z_flat
+            final_ply = flat_ply_path
+        else:
+            final_ply = orig_ply_path
+
+        check_stop(stop_event)
+        progress_cb(f"Building and writing Binary PLY...", 85)
+        num_verts, num_faces = build_and_save_mesh_fast(z, final_ply, eff_xy_scale, eff_z_scale, stop_event)
+        
+        print(f"SUCCESS! Extracted {num_verts:,} vertices and {num_faces:,} faces.")
+        done_cb(new_w, new_h, num_verts, num_faces)
+        
+    except InterruptedError as e:
+        print(f"\n[!] {str(e)}")
+        error_cb(str(e))
+    except Exception as exc:
+        print("\n=== ERROR OCCURRED ===")
+        traceback.print_exc()
+        error_cb(str(exc))
+
+
+# ──────────────────────────────── GUI ────────────────────────────────────────
+
+DARK_BG   = "#1e1e2e"
+PANEL_BG  = "#2a2a3e"
+ACCENT    = "#7c6af7"
+ACCENT_H  = "#9d8fff"
+FG        = "#cdd6f4"
+FG_DIM    = "#6c7086"
+SUCCESS   = "#a6e3a1"
+ERROR_C   = "#f38ba8"
+ENTRY_BG  = "#313244"
+FONT      = ("Segoe UI", 10)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+FONT_H1   = ("Segoe UI", 13, "bold")
+
+
+class InteractiveImageWindow(tk.Toplevel):
+    def __init__(self, master, title, img_path, instructions):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("850x750")
+        self.configure(bg=DARK_BG)
+        self.pts = []
+        self.dragging_idx = None
+        
+        try:
+            self.orig_img = Image.open(img_path).convert("RGB")
+            self.orig_w, self.orig_h = self.orig_img.size
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load image:\n{e}")
+            self.destroy()
+            return
+
+        lbl = tk.Label(self, text=instructions, bg=DARK_BG, fg=FG, font=FONT_BOLD)
+        lbl.pack(pady=10)
+
+        self.canvas_w = 800
+        self.canvas_h = 550
+        
+        self.canvas = tk.Canvas(self, width=self.canvas_w, height=self.canvas_h, cursor="crosshair", bg=ENTRY_BG, highlightthickness=0)
+        self.canvas.pack(padx=15, pady=(0, 10), fill="both", expand=True)
+
+        self.bottom_frame = tk.Frame(self, bg=DARK_BG)
+        self.bottom_frame.pack(fill="x", padx=15, pady=(0, 15))
+
+        scale_w = self.canvas_w / self.orig_w
+        scale_h = self.canvas_h / self.orig_h
+        self.scale = min(scale_w, scale_h) * 0.95
+        if self.scale > 1.0: self.scale = 1.0
+
+        self.pan_x = (self.orig_w - self.canvas_w / self.scale) / 2
+        self.pan_y = (self.orig_h - self.canvas_h / self.scale) / 2
+
+        self.tk_img_id = self.canvas.create_image(0, 0, anchor="nw")
+
+        self.canvas.bind("<Configure>", self.on_resize)
+        self.canvas.bind("<ButtonPress-1>", self.on_left_press)
+        self.canvas.bind("<B1-Motion>", self.on_left_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
+        
+        self.canvas.bind("<ButtonPress-2>", self.on_pan_start)
+        self.canvas.bind("<B2-Motion>", self.on_pan_drag)
+        self.canvas.bind("<ButtonPress-3>", self.on_pan_start)
+        self.canvas.bind("<B3-Motion>", self.on_pan_drag)
+        self.canvas.bind("<MouseWheel>", self.on_zoom)
+        self.canvas.bind("<Button-4>", self.on_zoom_in)
+        self.canvas.bind("<Button-5>", self.on_zoom_out)
+
+        self.last_mx = 0
+        self.last_my = 0
+
+        self.redraw()
+
+    def on_resize(self, event):
+        if event.width > 50 and event.height > 50:
+            if event.width != self.canvas_w or event.height != self.canvas_h:
+                self.canvas_w = event.width
+                self.canvas_h = event.height
+                self.redraw()
+
+    def img_to_canvas(self, ix, iy): return (ix - self.pan_x) * self.scale, (iy - self.pan_y) * self.scale
+    def canvas_to_img(self, cx, cy): return self.pan_x + cx / self.scale, self.pan_y + cy / self.scale
+
+    def redraw(self):
+        left = max(0, int(self.pan_x))
+        top = max(0, int(self.pan_y))
+        right = min(self.orig_w, int(self.pan_x + self.canvas_w / self.scale))
+        bottom = min(self.orig_h, int(self.pan_y + self.canvas_h / self.scale))
+
+        if right > left and bottom > top:
+            cropped = self.orig_img.crop((left, top, right, bottom))
+            new_w, new_h = int((right - left) * self.scale), int((bottom - top) * self.scale)
+            if new_w > 0 and new_h > 0:
+                self.tk_img = ImageTk.PhotoImage(cropped.resize((new_w, new_h), Image.Resampling.BILINEAR))
+                self.canvas.coords(self.tk_img_id, (left - self.pan_x) * self.scale, (top - self.pan_y) * self.scale)
+                self.canvas.itemconfig(self.tk_img_id, image=self.tk_img)
+
+        self.canvas.delete("overlay")
+        self.draw_overlays()
+
+    def draw_overlays(self):
+        for ix, iy in self.pts:
+            cx, cy = self.img_to_canvas(ix, iy)
+            self.canvas.create_oval(cx-5, cy-5, cx+5, cy+5, fill=ACCENT, outline="#ffffff", width=1.5, tags="overlay")
+
+    def on_zoom(self, event): self._do_zoom(1.2 if event.delta > 0 else 1/1.2, event.x, event.y)
+    def on_zoom_in(self, event): self._do_zoom(1.2, event.x, event.y)
+    def on_zoom_out(self, event): self._do_zoom(1/1.2, event.x, event.y)
+
+    def _do_zoom(self, factor, cx, cy):
+        ix, iy = self.canvas_to_img(cx, cy)
+        self.scale = max(0.01, min(100.0, self.scale * factor))
+        self.pan_x = ix - cx / self.scale
+        self.pan_y = iy - cy / self.scale
+        self.redraw()
+
+    def on_pan_start(self, event): self.last_mx, self.last_my = event.x, event.y
+
+    def on_pan_drag(self, event):
+        self.pan_x -= (event.x - self.last_mx) / self.scale
+        self.pan_y -= (event.y - self.last_my) / self.scale
+        self.last_mx, self.last_my = event.x, event.y
+        self.redraw()
+
+    def on_left_press(self, event):
+        click_ix, click_iy = self.canvas_to_img(event.x, event.y)
+        hit_radius = 10 / self.scale
+        for i, (px, py) in enumerate(self.pts):
+            if math.hypot(px - click_ix, py - click_iy) < hit_radius:
+                self.dragging_idx = i
+                return
+        self.add_point(event.x, event.y)
+
+    def on_left_drag(self, event):
+        if self.dragging_idx is not None:
+            ix, iy = self.canvas_to_img(event.x, event.y)
+            ix = max(0.0, min(float(self.orig_w), ix))
+            iy = max(0.0, min(float(self.orig_h), iy))
+            self.pts[self.dragging_idx] = (ix, iy)
+            self.redraw()
+            if hasattr(self, 'update_ui'): self.update_ui()
+
+    def on_left_release(self, event):
+        self.dragging_idx = None
+        
+    def add_point(self, cx, cy):
+        pass
+
+
+class CalibrationWindow(InteractiveImageWindow):
+    def __init__(self, master, img_path, callback):
+        super().__init__(master, "Calibrate Scale", img_path, "Left Click: Add 2 points | Drag: Move points | Scroll: Zoom | Right-Click: Pan")
+        self.callback = callback
+
+        self.lbl_info = tk.Label(self.bottom_frame, text="0 points selected (need 2)", bg=DARK_BG, fg=FG)
+        self.lbl_info.pack(side="left")
+
+        btn_clear = tk.Button(self.bottom_frame, text="Clear All", command=self.clear_pts, bg=ENTRY_BG, fg=FG, relief="flat")
+        btn_clear.pack(side="left", padx=(15, 0))
+
+        tk.Label(self.bottom_frame, text="Distance (mm):", bg=DARK_BG, fg=FG_DIM, font=FONT).pack(side="left", padx=(20, 4))
+        self.dist_var = tk.StringVar()
+        self.dist_entry = tk.Entry(self.bottom_frame, textvariable=self.dist_var, bg=ENTRY_BG, fg=FG,
+                                   relief="flat", font=FONT, width=8)
+        self.dist_entry.pack(side="left", ipady=3)
+        self.dist_var.trace_add("write", lambda *_: self.update_ui())
+
+        self.btn_confirm = tk.Button(self.bottom_frame, text="Confirm", command=self.confirm,
+                                     bg=ACCENT, fg="#ffffff", relief="flat", state="disabled")
+        self.btn_confirm.pack(side="right")
+
+    def draw_overlays(self):
+        super().draw_overlays()
+        if len(self.pts) == 2:
+            c1x, c1y = self.img_to_canvas(*self.pts[0])
+            c2x, c2y = self.img_to_canvas(*self.pts[1])
+            self.canvas.create_line(c1x, c1y, c2x, c2y, fill=ACCENT, width=2, dash=(4, 2), tags="overlay")
+
+    def add_point(self, cx, cy):
+        if len(self.pts) < 2:
+            ix, iy = self.canvas_to_img(cx, cy)
+            if 0 <= ix <= self.orig_w and 0 <= iy <= self.orig_h:
+                self.pts.append((ix, iy))
+                self.redraw()
+                self.update_ui()
+
+    def clear_pts(self):
+        self.pts.clear()
+        self.redraw()
+        self.update_ui()
+
+    def _dist_valid(self):
+        try:
+            return float(self.dist_var.get()) > 0
+        except ValueError:
+            return False
+
+    def update_ui(self):
+        cnt = len(self.pts)
+        ready = cnt == 2 and self._dist_valid()
+        if cnt == 2:
+            self.lbl_info.config(text="2 points selected." + (" Enter distance and confirm." if not self._dist_valid() else " Ready."))
+        else:
+            self.lbl_info.config(text=f"{cnt} points selected (need 2)")
+        self.btn_confirm.config(state="normal" if ready else "disabled")
+
+    def confirm(self):
+        dist_mm = float(self.dist_var.get())
+        px_dist = math.hypot(self.pts[1][0] - self.pts[0][0], self.pts[1][1] - self.pts[0][1])
+        if px_dist > 0:
+            self.callback(dist_mm / px_dist)
+            self.destroy()
+
+
+class PointSelectionWindow(InteractiveImageWindow):
+    def __init__(self, master, img_path, callback):
+        super().__init__(master, "Select Flattening Points", img_path, "Left Click: Add points (min 4) | Drag: Move points | Scroll: Zoom | Right-Click: Pan")
+        self.callback = callback
+
+        # ── fitting mode selector ──────────────────────────────────────────
+        mode_frame = tk.Frame(self, bg=DARK_BG, padx=10, pady=6)
+        mode_frame.pack(fill="x", before=self.bottom_frame)
+        tk.Label(mode_frame, text="Fitting mode:", bg=DARK_BG, fg=FG, font=FONT_BOLD).pack(side="left", padx=(0, 12))
+
+        self.fitting_mode_var = tk.StringVar(value="sphere")
+        modes = [
+            ("sphere",      "Sphere",      "Best for round/spherical surfaces. Robust with 4+ points."),
+            ("paraboloid",  "Paraboloid",  "Handles different curvature on X and Y axes. Use when the surface bends differently in two directions."),
+            ("tps",         "Thin-Plate Spline", "Passes exactly through every selected point. Best for irregular or asymmetric surfaces. Can be slow on large images."),
+        ]
+        for val, label, tip in modes:
+            col = tk.Frame(mode_frame, bg=DARK_BG)
+            col.pack(side="left", padx=(0, 18))
+            rb = tk.Radiobutton(col, text=label, variable=self.fitting_mode_var, value=val,
+                                bg=DARK_BG, fg=FG, selectcolor=PANEL_BG,
+                                activebackground=DARK_BG, activeforeground=FG,
+                                font=FONT, command=self.update_ui)
+            rb.pack(anchor="w")
+            tk.Label(col, text=tip, bg=DARK_BG, fg=FG_DIM,
+                     font=("Segoe UI", 8), wraplength=170, justify="left").pack(anchor="w")
+
+        # ── bottom bar ─────────────────────────────────────────────────────
+        self.lbl_count = tk.Label(self.bottom_frame, text="0 points selected (need 4+)", bg=DARK_BG, fg=FG)
+        self.lbl_count.pack(side="left")
+
+        btn_clear = tk.Button(self.bottom_frame, text="Clear All", command=self.clear_pts, bg=ENTRY_BG, fg=FG, relief="flat")
+        btn_clear.pack(side="left", padx=15)
+
+        self.btn_confirm = tk.Button(self.bottom_frame, text="Confirm", command=self.confirm,
+                                     bg=ACCENT, fg="#ffffff", relief="flat", state="disabled")
+        self.btn_confirm.pack(side="right")
+
+    def add_point(self, cx, cy):
+        ix, iy = self.canvas_to_img(cx, cy)
+        if 0 <= ix <= self.orig_w and 0 <= iy <= self.orig_h:
+            self.pts.append((ix, iy))
+            self.redraw()
+            self.update_ui()
+
+    def clear_pts(self):
+        self.pts.clear()
+        self.redraw()
+        self.update_ui()
+
+    def update_ui(self):
+        cnt = len(self.pts)
+        mode = self.fitting_mode_var.get()
+        mode_label = {"sphere": "Sphere", "paraboloid": "Paraboloid", "tps": "TPS"}.get(mode, mode)
+        if cnt < 4:
+            label = f"{cnt} points selected (need 4+)"
+        else:
+            label = f"{cnt} points — {mode_label} fit"
+        self.lbl_count.config(text=label)
+        self.btn_confirm.config(state="normal" if cnt >= 4 else "disabled")
+
+    def confirm(self):
+        self.callback(self.pts, self.fitting_mode_var.get())
+        self.destroy()
+
+
+class GUIConsole:
+    def __init__(self, text_widget): self.text_widget = text_widget
+    def write(self, text): self.text_widget.after(0, self._append, text) if text else None
+    def _append(self, text):
+        self.text_widget.configure(state='normal')
+        self.text_widget.insert('end', text)
+        self.text_widget.see('end')
+        self.text_widget.configure(state='disabled')
+    def flush(self): pass
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"Normal2Mesh ({APP_VERSION})")
+        self.geometry("670x900")
+        self.minsize(530, 800)
+        self.configure(bg=DARK_BG)
+        self.flatten_pts = []
+        self.flatten_mode = "sphere"
+        self.stop_event = threading.Event()
+        
+        # --- SAFE WINDOW ICON LOADING (PNG ONLY) ---
+        try:
+            png_path = resource_path("normal_icon.png")
+            if os.path.exists(png_path):
+                img = tk.PhotoImage(file=png_path)
+                self.iconphoto(True, img)
+        except Exception:
+            pass  # Silently skip if the icon doesn't load. The app will work perfectly anyway!
+
+        self._build_ui()
+        self._center_window()
+        
+        self.console = GUIConsole(self.console_text)
+        sys.stdout = self.console; sys.stderr = self.console
+        print("Application initialized. Waiting for input...")
+
+    def _build_ui(self):
+        hdr = tk.Frame(self, bg=ACCENT, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"Normal2Mesh {APP_VERSION}", font=FONT_H1, bg=ACCENT, fg="#ffffff").pack()
+
+        body = tk.Frame(self, bg=DARK_BG)
+        body.pack(fill="both", expand=True, padx=18, pady=10)
+
+        # FILES
+        self._section(body, "Files")
+        inp_row = tk.Frame(body, bg=DARK_BG); inp_row.pack(fill="x", pady=(0, 6))
+        self.input_var = tk.StringVar()
+        tk.Entry(inp_row, textvariable=self.input_var, bg=ENTRY_BG, fg=FG, relief="flat", font=FONT).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
+        self._btn(inp_row, "Input Normal Map", self._browse_input).pack(side="left")
+
+        out_row = tk.Frame(body, bg=DARK_BG); out_row.pack(fill="x", pady=(0, 6))
+        self.output_var = tk.StringVar()
+        tk.Entry(out_row, textvariable=self.output_var, bg=ENTRY_BG, fg=FG, relief="flat", font=FONT).pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
+        self._btn(out_row, "Output Folder", self._browse_output).pack(side="left")
+
+        # OPTIONS
+        self._section(body, "Options")
+        opts = tk.Frame(body, bg=DARK_BG); opts.pack(fill="x", pady=(0, 8))
+
+        tk.Label(opts, text="Downsample", bg=DARK_BG, fg=FG_DIM, font=FONT).grid(row=0, column=0, sticky="w", pady=4)
+        self.ds_opts = ["1× (Full resolution)", "1/2", "1/4", "1/8", "1/16", "1/32", "1/64", "1/128"]
+        self.ds_var = tk.StringVar(value=self.ds_opts[0])
+        ds_menu = tk.OptionMenu(opts, self.ds_var, *self.ds_opts)
+        ds_menu.config(bg=ENTRY_BG, fg=FG, activebackground=PANEL_BG, activeforeground=FG, relief="flat", highlightthickness=0, font=FONT, width=20, anchor="w")
+        ds_menu["menu"].config(bg=ENTRY_BG, fg=FG, font=FONT)
+        ds_menu.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        tk.Label(opts, text="XY scale (1px in mm)", bg=DARK_BG, fg=FG_DIM, font=FONT).grid(row=1, column=0, sticky="w", pady=4)
+        self.xy_var = tk.StringVar(value="1.0")
+        tk.Entry(opts, textvariable=self.xy_var, bg=ENTRY_BG, fg=FG, relief="flat", font=FONT, width=12).grid(row=1, column=1, sticky="w", padx=(10, 0), ipady=4)
+
+        tk.Label(opts, text="Z scale (Height multi)", bg=DARK_BG, fg=FG_DIM, font=FONT).grid(row=2, column=0, sticky="w", pady=4)
+        self.z_var = tk.StringVar(value="1.0")
+        tk.Entry(opts, textvariable=self.z_var, bg=ENTRY_BG, fg=FG, relief="flat", font=FONT, width=12).grid(row=2, column=1, sticky="w", padx=(10, 0), ipady=4)
+
+        self._btn(opts, "📏 Set scale", self._open_calibration, txt_color="#000000").grid(row=1, column=2, rowspan=2, padx=(15, 0), sticky="ns", pady=4)
+
+        # Normal Map Format Dropdown
+        tk.Label(opts, text="Normal Map Format", bg=DARK_BG, fg=FG_DIM, font=FONT).grid(row=3, column=0, sticky="w", pady=4)
+        self.norm_format_var = tk.StringVar(value="OpenGL")
+        norm_format_menu = tk.OptionMenu(opts, self.norm_format_var, "DirectX", "OpenGL")
+        norm_format_menu.config(bg=ENTRY_BG, fg=FG, activebackground=PANEL_BG, activeforeground=FG, relief="flat", highlightthickness=0, font=FONT, width=20, anchor="w")
+        norm_format_menu["menu"].config(bg=ENTRY_BG, fg=FG, font=FONT)
+        norm_format_menu.grid(row=3, column=1, sticky="w", padx=(10, 0))
+
+        # FLATTEN (DESPHERICIZE) SECTION — immediately after Normal Map Format
+        self.use_flatten_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(body, text="Enable Flattening (Curvature Removal)", variable=self.use_flatten_var, command=self._toggle_flatten, bg=PANEL_BG, fg=FG, selectcolor=DARK_BG, activebackground=PANEL_BG, activeforeground=FG, font=FONT_BOLD, anchor="w", padx=10, pady=5).pack(fill="x", pady=(10, 0))
+
+        self.flat_frame = tk.Frame(body, bg=ENTRY_BG, padx=10, pady=10)
+
+        flat_controls = tk.Frame(self.flat_frame, bg=ENTRY_BG)
+        flat_controls.pack(fill="x")
+        self._btn(flat_controls, "Select Points on Surface", self._open_flatten_pts).pack(side="left")
+        self.lbl_flat_pts = tk.Label(flat_controls, text="0 points selected", bg=ENTRY_BG, fg=FG, font=FONT)
+        self.lbl_flat_pts.pack(side="left", padx=15)
+        tk.Button(flat_controls, text="Clear", command=self._clear_flatten_pts, bg=DARK_BG, fg=FG, relief="flat").pack(side="left")
+
+        self.export_orig_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.flat_frame, text="Also export Unflattened Surface", variable=self.export_orig_var, bg=ENTRY_BG, fg=FG, selectcolor=PANEL_BG, activebackground=ENTRY_BG, activeforeground=FG).pack(anchor="w", pady=(10, 2))
+
+        norm_fmt_frame = tk.Frame(self.flat_frame, bg=ENTRY_BG)
+        norm_fmt_frame.pack(anchor="w", pady=(0, 2))
+
+        self.export_flat_norm_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(norm_fmt_frame, text="Also export Flattened Normal Map as:", variable=self.export_flat_norm_var, bg=ENTRY_BG, fg=FG, selectcolor=PANEL_BG, activebackground=ENTRY_BG, activeforeground=FG).pack(side="left")
+
+        self.norm_fmt_var = tk.StringVar(value="PNG")
+        norm_fmt_menu = tk.OptionMenu(norm_fmt_frame, self.norm_fmt_var, "PNG", "JPG", "TIFF")
+        norm_fmt_menu.config(bg=ENTRY_BG, fg=FG, activebackground=PANEL_BG, activeforeground=FG, relief="flat", highlightthickness=0, font=("Segoe UI", 9))
+        norm_fmt_menu["menu"].config(bg=ENTRY_BG, fg=FG, font=("Segoe UI", 9))
+        norm_fmt_menu.pack(side="left", padx=5)
+
+        self.rederive_var = tk.BooleanVar(value=False)
+        if SHOW_DEBUG_OPTIONS:
+            tk.Checkbutton(self.flat_frame, text="[Debug] Re-derive PLY & Displacement from Flattened Normal Map", variable=self.rederive_var, bg=ENTRY_BG, fg=FG_DIM, selectcolor=PANEL_BG, activebackground=ENTRY_BG, activeforeground=FG, font=FONT).pack(anchor="w", pady=(0, 2))
+
+        # BOTTOM OPTIONS — export displacement and overwrite (below flatten section)
+        self.bottom_opts_frame = tk.Frame(body, bg=DARK_BG)
+        self.bottom_opts_frame.pack(fill="x", pady=(6, 0))
+
+        self.export_disp_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.bottom_opts_frame, text="Export 16-bit Displacement Map & Range (.tiff, .txt)", variable=self.export_disp_var, bg=DARK_BG, fg=FG, selectcolor=PANEL_BG, activebackground=DARK_BG, activeforeground=FG, font=FONT).pack(anchor="w", pady=(2, 0))
+
+        self.overwrite_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(self.bottom_opts_frame, text="Overwrite existing files", variable=self.overwrite_var, bg=DARK_BG, fg=FG, selectcolor=PANEL_BG, activebackground=DARK_BG, activeforeground=FG, font=FONT).pack(anchor="w", pady=(2, 4))
+
+        # STATUS / CONSOLE
+        self.progress = ttk.Progressbar(body, orient="horizontal", mode="determinate")
+        style = ttk.Style(self); style.theme_use("default")
+        style.configure("TProgressbar", troughcolor=PANEL_BG, background=ACCENT, bordercolor=PANEL_BG, lightcolor=ACCENT, darkcolor=ACCENT)
+        self.progress.pack(fill="x", pady=(15, 2))
+
+        self.status_var = tk.StringVar(value="Ready.")
+        self.status_lbl = tk.Label(body, textvariable=self.status_var, bg=DARK_BG, fg=FG_DIM, font=("Segoe UI", 9), anchor="w")
+        self.status_lbl.pack(fill="x")
+
+        self.run_btn = self._btn(body, "  ▶  Convert  ", self._start, large=True, txt_color="#000000")
+        self.run_btn.pack(pady=10)
+
+        self._section(body, "Console Log")
+        console_frame = tk.Frame(body, bg=ENTRY_BG); console_frame.pack(fill="both", expand=True)
+        self.console_text = tk.Text(console_frame, bg=ENTRY_BG, fg=SUCCESS, font=("Consolas", 9), state='disabled', wrap='word', relief="flat", padx=5, pady=5)
+        self.console_text.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(console_frame, command=self.console_text.yview, bg=ENTRY_BG)
+        scrollbar.pack(side="right", fill="y"); self.console_text['yscrollcommand'] = scrollbar.set
+
+    def _toggle_flatten(self):
+        if self.use_flatten_var.get():
+            self.flat_frame.pack(fill="x", before=self.bottom_opts_frame, pady=(0, 6))
+        else:
+            self.flat_frame.pack_forget()
+
+    def _open_flatten_pts(self):
+        inp = self.input_var.get().strip()
+        if not inp or not Path(inp).exists():
+            messagebox.showerror("Error", "Please select a valid input normal map first.")
+            return
+        PointSelectionWindow(self, inp, self._apply_flatten_pts)
+
+    def _apply_flatten_pts(self, pts, fitting_mode):
+        self.flatten_pts = pts
+        self.flatten_mode = fitting_mode
+        mode_label = {"sphere": "Sphere", "paraboloid": "Paraboloid", "tps": "TPS"}.get(fitting_mode, fitting_mode)
+        self.lbl_flat_pts.config(text=f"{len(pts)} points — {mode_label}")
+
+    def _clear_flatten_pts(self):
+        self.flatten_pts.clear()
+        self.lbl_flat_pts.config(text="0 points selected")
+
+    def _section(self, parent, text):
+        f = tk.Frame(parent, bg=DARK_BG); f.pack(fill="x", pady=(10, 2))
+        tk.Label(f, text=text, bg=DARK_BG, fg=ACCENT, font=FONT_BOLD).pack(side="left")
+        tk.Frame(f, bg=FG_DIM, height=1).pack(side="left", fill="x", expand=True, padx=(8, 0), pady=6)
+
+    def _btn(self, parent, text, cmd, large=False, txt_color="#ffffff"):
+        f = ("Segoe UI", 11, "bold") if large else FONT
+        b = tk.Button(parent, text=text, command=cmd, bg=ACCENT, fg=txt_color, activebackground=ACCENT_H, activeforeground=txt_color, relief="flat", font=f, cursor="hand2", padx=14 if large else 10, pady=6 if large else 4)
+        b.bind("<Enter>", lambda e: b.config(bg=b.cget("activebackground"))); b.bind("<Leave>", lambda e: b.config(bg=b.cget("bg")))
+        return b
+
+    def _center_window(self):
+        self.update_idletasks()
+        self.geometry(f"+{(self.winfo_screenwidth() - self.winfo_width()) // 2}+{(self.winfo_screenheight() - self.winfo_height()) // 2}")
+
+    def _browse_input(self):
+        p = filedialog.askopenfilename(filetypes=[("Image files", "*.png *.jpg *.jpeg *.tiff *.tif *.bmp *.exr"), ("All files", "*.*")])
+        if p:
+            self.input_var.set(p)
+            if not self.output_var.get(): self.output_var.set(str(Path(p).with_suffix(".ply")))
+
+    def _browse_output(self):
+        p = filedialog.asksaveasfilename(defaultextension=".ply", filetypes=[("PLY mesh", "*.ply"), ("All files", "*.*")])
+        if p: self.output_var.set(p)
+
+    def _open_calibration(self):
+        inp = self.input_var.get().strip()
+        if not inp or not Path(inp).exists():
+            messagebox.showerror("Error", "Please select a valid input normal map first.")
+            return
+        CalibrationWindow(self, inp, lambda v: (self.xy_var.set(f"{v:.6g}"), self.z_var.set(f"{v:.6g}"), print(f"Calibration successful! Set 1 pixel = {v:.6g} mm.")))
+
+    def _start(self):
+        inp, out = self.input_var.get().strip(), self.output_var.get().strip()
+        if not inp or not out:
+            messagebox.showerror("Error", "Please specify input and output paths.")
+            return
+        
+        try: xy, zs = float(self.xy_var.get()), float(self.z_var.get())
+        except ValueError: messagebox.showerror("Error", "XY scale and Z scale must be numbers."); return
+
+        ds_val = int(self.ds_var.get().split("1/")[1]) if "1/" in self.ds_var.get() else 1
+        flip_y_val = self.norm_format_var.get() == "OpenGL"
+
+        if self.use_flatten_var.get():
+            if len(self.flatten_pts) < 4:
+                messagebox.showwarning("Missing Points", "Flattening is enabled but less than 4 points are selected. Please select points or uncheck flattening.")
+                return
+            active_flatten_pts = self.flatten_pts
+        else:
+            active_flatten_pts = []
+
+        out_base = str(Path(out).with_suffix(''))
+        if out_base.endswith("_flat_srf"):
+            out_base = out_base[:-9]
+        elif out_base.endswith("_srf"):
+            out_base = out_base[:-4]
+
+        files_to_check = []
+        if not self.use_flatten_var.get() or not len(active_flatten_pts) >= 4 or self.export_orig_var.get():
+            files_to_check.append(Path(f"{out_base}_srf.ply"))
+
+        if self.use_flatten_var.get() and len(active_flatten_pts) >= 4:
+            files_to_check.append(Path(f"{out_base}_flat_srf.ply"))
+
+            if self.export_flat_norm_var.get():
+                ext = self.norm_fmt_var.get().lower()
+                files_to_check.append(Path(f"{out_base}_flat_normal.{ext}"))
+
+            if self.export_disp_var.get():
+                files_to_check.append(Path(f"{out_base}_flat_srf_disp.tiff"))
+
+            if self.rederive_var.get():
+                files_to_check.append(Path(f"{out_base}_flat_srf_rederived.ply"))
+                if self.export_disp_var.get():
+                    files_to_check.append(Path(f"{out_base}_flat_srf_rederived_disp.tiff"))
+
+            if self.export_orig_var.get() and self.export_disp_var.get():
+                files_to_check.append(Path(f"{out_base}_srf_disp.tiff"))
+
+        elif self.export_disp_var.get():
+            files_to_check.append(Path(f"{out_base}_srf_disp.tiff"))
+
+        if not self.overwrite_var.get():
+            existing_files = [p.name for p in files_to_check if p.exists()]
+            if existing_files:
+                messagebox.showwarning(
+                    "Process Stopped",
+                    "The process was stopped because overwrite is disabled and "
+                    "the following output file(s) already exist in the output folder:\\n\\n"
+                    + "\\n".join(existing_files)
+                )
+                self.status_var.set("Stopped: existing output file detected.")
+                self.status_lbl.config(fg=ERROR_C)
+                return
+
+        self.stop_event.clear()
+        self.run_btn.config(text="  ⏹  Stop  ", command=self._stop, bg=ERROR_C, fg="#ffffff", activebackground="#d77a94", activeforeground="#ffffff")
+
+        self.progress["value"] = 0
+        self.status_var.set("Starting..."); self.status_lbl.config(fg=FG_DIM)
+
+        threading.Thread(
+            target=run_conversion,
+            args=(inp, out, ds_val, xy, zs, flip_y_val, active_flatten_pts,
+                  self.flatten_mode,
+                  self.export_orig_var.get(), self.export_flat_norm_var.get(), self.norm_fmt_var.get(), self.export_disp_var.get(),
+                  self.rederive_var.get(),
+                  self.stop_event,
+                  lambda m, p: self.after(0, lambda: (self.status_var.set(m), self.progress.config(value=p))),
+                  lambda w, h, v, f: self.after(0, lambda: (self.progress.config(value=100), self.status_var.set(f"Done ✓ {w}×{h} px"), self.status_lbl.config(fg=SUCCESS), self._reset_run_btn())),
+                  lambda e: self.after(0, lambda: (self.progress.config(value=0), self.status_var.set(str(e)), self.status_lbl.config(fg=ERROR_C), self._reset_run_btn()))
+                 ), daemon=True).start()
+
+    def _stop(self):
+        self.stop_event.set()
+        self.run_btn.config(state="disabled", text="  Stopping...  ")
+        self.status_var.set("Stopping process, please wait...")
+        self.status_lbl.config(fg=ERROR_C)
+
+    def _reset_run_btn(self):
+        self.run_btn.config(state="normal", text="  ▶  Convert Normal to Mesh  ", command=self._start, bg=ACCENT, fg="#000000", activebackground=ACCENT_H, activeforeground="#000000")
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
