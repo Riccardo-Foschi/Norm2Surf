@@ -1,5 +1,5 @@
 # Norm2Surf
-A standalone Python Vibecoded application to create a surface from a normal map. It includes the flattening of normal maps via desphericalization and the creation of corresponding heightmaps.
+A standalone Python Vibecoded application to create a surface from a normal map (via Fourier integration). It includes the flattening of normal maps via spherical, parabolic, and TPS interpolation, and the creation of corresponding heightmaps.
 
 -----> [Download the portable app from here!](https://github.com/Riccardo-Foschi/Norm2Surf/releases/download/v2.0/Normal2Mesh.exe)<-----
 
